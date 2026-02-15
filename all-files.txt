@@ -1,0 +1,301 @@
+== file: package.json ==
+{
+  "name": "univ-portal",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node src/server.js",
+    "start": "node src/server.js",
+    "migrate": "node src/migrate.js",
+    "seed": "node src/seed.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.1.0",
+    "cookie-parser": "^1.4.6",
+    "csurf": "^1.11.0",
+    "dotenv": "^16.4.5",
+    "ejs": "^3.1.10",
+    "express": "^4.19.2",
+    "express-rate-limit": "^7.4.1",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0",
+    "nanoid": "^5.0.7",
+    "multer": "^1.4.5-lts.1"
+  }
+}
+
+== file: src/server.js ==
+require("dotenv").config();
+const path = require("path");
+const express = require("express");
+const morgan = require("morgan");
+const cookieParser = require("cookie-parser");
+
+const { security } = require("./security");
+const authRoutes = require("./routes/auth.routes");
+const portalRoutes = require("./routes/portal.routes");
+const adminRoutes = require("./routes/admin.routes");
+const importRoutes = require("./routes/import.routes");
+
+const app = express();
+security(app);
+
+app.use(morgan("dev"));
+app.use(cookieParser());
+
+app.set("view engine", "ejs");
+app.set("views", path.join(__dirname, "views"));
+
+app.use("/public", express.static(path.join(__dirname, "../public")));
+
+app.use(authRoutes);
+app.use(portalRoutes);
+app.use(adminRoutes);
+app.use(importRoutes);
+
+app.get("/", (req, res) => res.redirect("/login"));
+
+const port = Number(process.env.PORT || 3000);
+app.listen(port, () => console.log(`Server running: http://localhost:${port}`));
+
+== file: src/db.js ==
+const Database = require("better-sqlite3");
+const path = require("path");
+
+const db = new Database(path.join(__dirname, "..", "data.sqlite"));
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
+
+module.exports = db;
+
+== file: src/security.js ==
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+
+function security(app) {
+  app.set("trust proxy", 1);
+  app.use(helmet({ contentSecurityPolicy: false }));
+  app.use(rateLimit({
+    windowMs: 60 * 1000,
+    limit: 200,
+    standardHeaders: "draft-7",
+    legacyHeaders: false
+  }));
+}
+
+module.exports = { security };
+
+== file: src/auth.js ==
+const { nanoid } = require("nanoid");
+const db = require("./db");
+const crypto = require("crypto");
+
+function addDaysISO(days) {
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  return d.toISOString();
+}
+
+function createSession(res, userId) {
+  const sid = nanoid();
+  const csrfSecret = crypto.randomBytes(24).toString("hex");
+  db.prepare(`
+    INSERT INTO sessions(id,user_id,csrf_secret,expires_at)
+    VALUES(?,?,?,?)
+  `).run(sid, userId, csrfSecret, addDaysISO(7));
+  res.cookie("sid", sid, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: false,
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+}
+
+function destroySession(req, res) {
+  const sid = req.cookies?.sid;
+  if (sid) db.prepare(`DELETE FROM sessions WHERE id=?`).run(sid);
+  res.clearCookie("sid");
+}
+
+function requireAuth(req, res, next) {
+  const sid = req.cookies?.sid;
+  if (!sid) return res.redirect("/login");
+  const row = db
+    .prepare(`
+      SELECT s.id as sid, s.user_id, u.*
+      FROM sessions s JOIN users u ON u.id=s.user_id
+      WHERE s.id=? AND u.is_active=1
+    `)
+    .get(sid);
+  if (!row) return res.redirect("/login");
+  if (new Date(row.expires_at) < new Date()) {
+    db.prepare(`DELETE FROM sessions WHERE id=?`).run(sid);
+    return res.redirect("/login");
+  }
+  req.user = row;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== "admin") return res.status(403).send("Forbidden");
+  next();
+}
+
+function audit(req, action, meta = {}) {
+  db.prepare(
+    `INSERT INTO audit_logs(id,user_id,action,ip,user_agent,meta_json)
+     VALUES(?,?,?,?,?,?)`
+  ).run(
+    nanoid(),
+    req.user?.id ?? null,
+    action,
+    req.ip,
+    req.headers["user-agent"] ?? null,
+    JSON.stringify(meta)
+  );
+}
+
+module.exports = { createSession, destroySession, requireAuth, requireAdmin, audit };
+
+== file: src/migrate.js ==
+const db = require("./db");
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  student_id TEXT UNIQUE,
+  email TEXT UNIQUE,
+  name TEXT NOT NULL,
+  faculty TEXT NOT NULL,
+  dept TEXT NOT NULL,
+  year INTEGER NOT NULL,
+  role TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  is_active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  csrf_secret TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS portal_config (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS announcements (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  is_published INTEGER NOT NULL DEFAULT 0,
+  publish_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS timetables (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  day_of_week INTEGER NOT NULL,
+  period INTEGER NOT NULL,
+  course_name TEXT NOT NULL,
+  room TEXT,
+  teacher TEXT,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS grades (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  course_code TEXT NOT NULL,
+  course_name TEXT NOT NULL,
+  credits INTEGER NOT NULL,
+  grade TEXT NOT NULL,
+  confirmed INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS judgments (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  type TEXT NOT NULL,
+  result TEXT NOT NULL,
+  comment TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS tuition (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  term TEXT NOT NULL,
+  amount_yen INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  due_date TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE TABLE IF NOT EXISTS audit_logs (
+  id TEXT PRIMARY KEY,
+  user_id TEXT,
+  action TEXT NOT NULL,
+  ip TEXT,
+  user_agent TEXT,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`);
+
+== file: src/seed.js ==
+const db = require("./db");
+const { nanoid } = require("nanoid");
+const bcrypt = require("bcryptjs");
+db.exec("DELETE FROM users");
+function upsertUser(u) {
+  const hash = bcrypt.hashSync(u.password, 12);
+  db.prepare(`
+    INSERT INTO users(id,student_id,email,name,faculty,dept,year,role,password_hash)
+    VALUES(?,?,?,?,?,?,?,?,?)
+  `).run(nanoid(), u.student_id, u.email, u.name, u.faculty, u.dept, u.year, u.role, hash);
+}
+upsertUser({
+  student_id: "20240001",
+  email: "student@example.com",
+  name: "山田 太郎",
+  faculty: "現代政策学部",
+  dept: "社会経済システム学科",
+  year: 4,
+  role: "student",
+  password: "pass1234"
+});
+upsertUser({
+  student_id: "99999999",
+  email: "admin@example.com",
+  name: "管理者",
+  faculty: "事務局",
+  dept: "教務課",
+  year: 0,
+  role: "admin",
+  password: "adminpass"
+});
+
+== file: src/routes/auth.routes.js ==
+const express = require("express");
+const bcrypt = require("bcryptjs");
+const db = require("../db");
+const { createSession, destroySession, audit } = require("../auth");
+router = express.Router();
+router.get("/login", (req, res) => res.render("login",{ error:null }));
+router.post("/auth/login", express.urlencoded({ extended:false }), (req, res) => {
+  const { student_id, password } = req.body;
+  const user = db.prepare("SELECT * FROM users WHERE student_id=?").get(student_id);
+  if (!user || !bcrypt.compareSync(password, user.password_hash)) {
+    audit(req,"login_failed",{ student_id });
+    return res.render("login",{ error:"ログイン失敗" });
+  }
+  createSession(res,user.id);
+  audit(req,"login_success",{ student_id });
+  return res.redirect("/");
+});
+router.post("/auth/logout",(req,res)=>{ destroySession(req,res); res.redirect("/login"); });
+module.exports = router;
+
+== file: src/routes/portal.routes.js ==
+// (continues...)
